@@ -62,6 +62,10 @@ class CudaRuntimeBackend:
         """Destroy a CUDA stream."""
         self._check(self.cudart.cudaStreamDestroy(stream), "cudaStreamDestroy")
 
+    def stream_handle(self, stream) -> int:
+        """Return the integer stream handle required by TensorRT."""
+        return int(stream)
+
     def malloc(self, size: int):
         """Allocate device memory."""
         result = self.cudart.cudaMalloc(size)
@@ -129,6 +133,10 @@ class PyCudaBackend:
     def stream_destroy(self, stream) -> None:
         """Destroy a CUDA stream."""
         del stream
+
+    def stream_handle(self, stream) -> int:
+        """Return the integer stream handle required by TensorRT."""
+        return int(stream.handle)
 
     def malloc(self, size: int):
         """Allocate device memory."""
@@ -295,7 +303,7 @@ class TrtRunner:
                 outputs[name] = host
                 output_buffers[name] = ptr
 
-            if not self.context.execute_async_v3(self.stream):
+            if not self.context.execute_async_v3(self.cuda.stream_handle(self.stream)):
                 raise RuntimeError("TensorRT execute_async_v3 failed.")
 
             for name, host in outputs.items():
