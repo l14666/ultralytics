@@ -333,6 +333,16 @@ def parse_imgsz(value: str | int | list[int] | tuple[int, ...]) -> int | list[in
     raise ValueError(f"Invalid --imgsz '{value}'. Use 640, 480,864, or 480x864.")
 
 
+def dataset_imgsz(imgsz: int | list[int]) -> int:
+    """Return the scalar pre-resize size required by YOLODataset."""
+    return imgsz if isinstance(imgsz, int) else max(imgsz)
+
+
+def imgsz_shape(imgsz: int | list[int]) -> tuple[int, int]:
+    """Return image size as (height, width)."""
+    return (imgsz, imgsz) if isinstance(imgsz, int) else (int(imgsz[0]), int(imgsz[1]))
+
+
 def select_output(outputs: dict[str, np.ndarray], output_name: str | None) -> np.ndarray:
     """Select the model output tensor used for YOLO postprocessing."""
     if output_name:
@@ -437,7 +447,7 @@ def make_validator(args: argparse.Namespace, data: dict[str, Any], save_dir: Pat
         "task": args.task,
         "mode": "val",
         "data": str(args.data),
-        "imgsz": args.imgsz,
+        "imgsz": dataset_imgsz(args.imgsz),
         "batch": args.batch,
         "workers": args.workers,
         "split": args.split,
@@ -466,7 +476,6 @@ def make_validator(args: argparse.Namespace, data: dict[str, Any], save_dir: Pat
     validator.device = torch.device("cpu")
     validator.data = data
     validator.stride = args.stride
-    validator.args.imgsz = args.imgsz
     validator.training = False
     validator.init_metrics(ModelStub(data["names"]))
     return validator
@@ -476,6 +485,10 @@ def build_loader(args: argparse.Namespace, data: dict[str, Any], validator) -> A
     """Build an Ultralytics validation dataloader."""
     img_path = data[args.split]
     dataset = build_yolo_dataset(validator.args, img_path, args.batch, data, mode="val", stride=args.stride)
+    if not isinstance(args.imgsz, int):
+        if args.rect:
+            raise ValueError("--rect is not supported with non-square --imgsz because it overrides the fixed shape.")
+        dataset.transforms.transforms[0].new_shape = imgsz_shape(args.imgsz)
     return build_dataloader(dataset, batch=args.batch, workers=args.workers, shuffle=False)
 
 
