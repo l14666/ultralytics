@@ -591,7 +591,7 @@ def main() -> None:
             postprocess_time += t3 - t2
             seen_batches += 1
 
-    stats = validator.get_stats()
+    metric_results = validator.get_stats()
     images_seen = max(validator.seen or 0, 1)
     validator.metrics.speed = {
         "preprocess": preprocess_time / images_seen * 1000.0,
@@ -600,11 +600,10 @@ def main() -> None:
         "postprocess": postprocess_time / images_seen * 1000.0,
     }
     results = {
-        **validator.metrics.results_dict,
+        **metric_results,
         "speed": validator.metrics.speed,
         "seen_images": int(validator.seen or 0),
         "seen_batches": int(seen_batches),
-        "stats_shapes": {k: list(v.shape) for k, v in stats.items()},
     }
     image_metrics = validator.metrics.box.image_metrics
     if args.task == "pose":
