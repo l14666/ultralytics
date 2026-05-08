@@ -34,20 +34,156 @@ class ModelStub:
         self.end2end = False
 
 
+class CudaRuntimeBackend:
+    """CUDA buffer backend using NVIDIA CUDA Python runtime bindings."""
+
+    def __init__(self, cudart: Any, name: str) -> None:
+        self.cudart = cudart
+        self.name = name
+
+    @staticmethod
+    def _error_code(result: Any) -> int:
+        """Extract the CUDA error code from cuda-python return values."""
+        return int(result[0] if isinstance(result, tuple) else result)
+
+    def _check(self, result: Any, op: str) -> None:
+        """Raise a RuntimeError when a CUDA runtime call fails."""
+        err = self._error_code(result)
+        if err != 0:
+            raise RuntimeError(f"{op} failed with CUDA error code {err}")
+
+    def stream_create(self):
+        """Create a CUDA stream."""
+        result = self.cudart.cudaStreamCreate()
+        self._check(result, "cudaStreamCreate")
+        return result[1]
+
+    def stream_destroy(self, stream) -> None:
+        """Destroy a CUDA stream."""
+        self._check(self.cudart.cudaStreamDestroy(stream), "cudaStreamDestroy")
+
+    def malloc(self, size: int):
+        """Allocate device memory."""
+        result = self.cudart.cudaMalloc(size)
+        self._check(result, "cudaMalloc")
+        return result[1]
+
+    def free(self, ptr) -> None:
+        """Free device memory."""
+        self._check(self.cudart.cudaFree(ptr), "cudaFree")
+
+    def memcpy_h2d_async(self, dst, src: np.ndarray, stream) -> None:
+        """Copy host memory to device asynchronously."""
+        self._check(
+            self.cudart.cudaMemcpyAsync(
+                dst,
+                src.ctypes.data,
+                int(src.nbytes),
+                self.cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
+                stream,
+            ),
+            "cudaMemcpyAsync(input H2D)",
+        )
+
+    def memcpy_d2h_async(self, dst: np.ndarray, src, stream) -> None:
+        """Copy device memory to host asynchronously."""
+        self._check(
+            self.cudart.cudaMemcpyAsync(
+                dst.ctypes.data,
+                src,
+                int(dst.nbytes),
+                self.cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
+                stream,
+            ),
+            "cudaMemcpyAsync(output D2H)",
+        )
+
+    def stream_synchronize(self, stream) -> None:
+        """Synchronize a CUDA stream."""
+        self._check(self.cudart.cudaStreamSynchronize(stream), "cudaStreamSynchronize")
+
+
+class PyCudaBackend:
+    """CUDA buffer backend using PyCUDA."""
+
+    name = "pycuda.driver"
+
+    def __init__(self) -> None:
+        import pycuda.driver as cuda
+
+        cuda.init()
+        try:
+            self._context = cuda.Context.attach()
+            self._autoinit = None
+        except cuda.LogicError:
+            import pycuda.autoinit as autoinit
+
+            self._context = None
+            self._autoinit = autoinit
+        self.cuda = cuda
+
+    def stream_create(self):
+        """Create a CUDA stream."""
+        return self.cuda.Stream()
+
+    def stream_destroy(self, stream) -> None:
+        """Destroy a CUDA stream."""
+        del stream
+
+    def malloc(self, size: int):
+        """Allocate device memory."""
+        return self.cuda.mem_alloc(size)
+
+    def free(self, ptr) -> None:
+        """Free device memory."""
+        ptr.free()
+
+    def memcpy_h2d_async(self, dst, src: np.ndarray, stream) -> None:
+        """Copy host memory to device asynchronously."""
+        self.cuda.memcpy_htod_async(dst, src, stream)
+
+    def memcpy_d2h_async(self, dst: np.ndarray, src, stream) -> None:
+        """Copy device memory to host asynchronously."""
+        self.cuda.memcpy_dtoh_async(dst, src, stream)
+
+    def stream_synchronize(self, stream) -> None:
+        """Synchronize a CUDA stream."""
+        stream.synchronize()
+
+
+def load_cuda_backend() -> CudaRuntimeBackend | PyCudaBackend:
+    """Load a supported CUDA Python backend."""
+    errors = []
+    try:
+        from cuda import cudart
+
+        return CudaRuntimeBackend(cudart, "cuda.cudart")
+    except Exception as e:
+        errors.append(f"cuda.cudart: {e}")
+    try:
+        from cuda.bindings import runtime as cudart
+
+        return CudaRuntimeBackend(cudart, "cuda.bindings.runtime")
+    except Exception as e:
+        errors.append(f"cuda.bindings.runtime: {e}")
+    try:
+        return PyCudaBackend()
+    except Exception as e:
+        errors.append(f"pycuda.driver: {e}")
+    raise ImportError("TensorRT evaluation requires a CUDA Python backend. Tried: " + "; ".join(errors))
+
+
 class TrtRunner:
     """Small TensorRT engine runner for a single input and one or more outputs."""
 
     def __init__(self, engine_path: Path, input_name: str | None = None, output_name: str | None = None) -> None:
         try:
             import tensorrt as trt
-            from cuda import cudart
         except ImportError as e:
-            raise ImportError(
-                "TensorRT evaluation requires Python packages 'tensorrt' and 'cuda-python' in the runtime environment."
-            ) from e
+            raise ImportError("TensorRT evaluation requires the Python package 'tensorrt'.") from e
 
         self.trt = trt
-        self.cudart = cudart
+        self.cuda = load_cuda_backend()
         self.logger = trt.Logger(trt.Logger.WARNING)
         with engine_path.open("rb") as f, trt.Runtime(self.logger) as runtime:
             self.engine = runtime.deserialize_cuda_engine(f.read())
@@ -73,8 +209,7 @@ class TrtRunner:
                 raise ValueError(f"Output tensor '{output_name}' not found. Available outputs: {self.output_names}")
             self.output_names = [output_name]
 
-        err, self.stream = cudart.cudaStreamCreate()
-        self._check_cuda(err, "cudaStreamCreate")
+        self.stream = self.cuda.stream_create()
 
     def _collect_io_names(self) -> tuple[list[str], list[str]]:
         """Collect TensorRT IO tensor names from an engine using TensorRT 10 API."""
@@ -96,7 +231,7 @@ class TrtRunner:
     def close(self) -> None:
         """Destroy the CUDA stream."""
         if getattr(self, "stream", None):
-            self.cudart.cudaStreamDestroy(self.stream)
+            self.cuda.stream_destroy(self.stream)
             self.stream = None
 
     def __enter__(self) -> "TrtRunner":
@@ -104,11 +239,6 @@ class TrtRunner:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
-
-    def _check_cuda(self, err: Any, op: str) -> None:
-        """Raise a RuntimeError when a CUDA runtime call fails."""
-        if int(err) != 0:
-            raise RuntimeError(f"{op} failed with CUDA error code {int(err)}")
 
     def _dtype(self, name: str) -> np.dtype:
         """Return the NumPy dtype for a TensorRT tensor."""
@@ -130,51 +260,42 @@ class TrtRunner:
         Returns:
             Mapping from output tensor name to NumPy array.
         """
-        cudart = self.cudart
         input_dtype = self._dtype(self.input_name)
         images = np.ascontiguousarray(images.astype(input_dtype, copy=False))
 
         if not self.context.set_input_shape(self.input_name, tuple(images.shape)):
             raise RuntimeError(f"Failed to set input shape {tuple(images.shape)} for tensor '{self.input_name}'.")
 
-        buffers: list[int] = []
+        buffers: list[Any] = []
+        output_buffers: dict[str, Any] = {}
         outputs: dict[str, np.ndarray] = {}
         try:
             input_size = int(images.nbytes)
-            err, input_ptr = cudart.cudaMalloc(input_size)
-            self._check_cuda(err, "cudaMalloc(input)")
+            input_ptr = self.cuda.malloc(input_size)
             buffers.append(input_ptr)
             self.context.set_tensor_address(self.input_name, int(input_ptr))
-            err = cudart.cudaMemcpyAsync(
-                input_ptr, images.ctypes.data, input_size, cudart.cudaMemcpyKind.cudaMemcpyHostToDevice, self.stream
-            )
-            self._check_cuda(err, "cudaMemcpyAsync(input H2D)")
+            self.cuda.memcpy_h2d_async(input_ptr, images, self.stream)
 
             for name in self.output_names:
                 shape = self._resolved_shape(name)
                 dtype = self._dtype(name)
                 host = np.empty(shape, dtype=dtype)
-                err, ptr = cudart.cudaMalloc(int(host.nbytes))
-                self._check_cuda(err, f"cudaMalloc({name})")
+                ptr = self.cuda.malloc(int(host.nbytes))
                 buffers.append(ptr)
                 self.context.set_tensor_address(name, int(ptr))
                 outputs[name] = host
+                output_buffers[name] = ptr
 
             if not self.context.execute_async_v3(self.stream):
                 raise RuntimeError("TensorRT execute_async_v3 failed.")
 
             for name, host in outputs.items():
-                ptr = self.context.get_tensor_address(name)
-                err = cudart.cudaMemcpyAsync(
-                    host.ctypes.data, ptr, int(host.nbytes), cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost, self.stream
-                )
-                self._check_cuda(err, f"cudaMemcpyAsync({name} D2H)")
-            err = cudart.cudaStreamSynchronize(self.stream)
-            self._check_cuda(err, "cudaStreamSynchronize")
+                self.cuda.memcpy_d2h_async(host, output_buffers[name], self.stream)
+            self.cuda.stream_synchronize(self.stream)
             return outputs
         finally:
             for ptr in buffers:
-                cudart.cudaFree(ptr)
+                self.cuda.free(ptr)
 
 
 def parse_classes(value: str | None) -> list[int] | None:
