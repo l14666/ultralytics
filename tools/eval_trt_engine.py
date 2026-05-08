@@ -157,17 +157,26 @@ def load_cuda_backend() -> CudaRuntimeBackend | PyCudaBackend:
     try:
         from cuda import cudart
 
-        return CudaRuntimeBackend(cudart, "cuda.cudart")
+        backend = CudaRuntimeBackend(cudart, "cuda.cudart")
+        stream = backend.stream_create()
+        backend.stream_destroy(stream)
+        return backend
     except Exception as e:
         errors.append(f"cuda.cudart: {e}")
     try:
         from cuda.bindings import runtime as cudart
 
-        return CudaRuntimeBackend(cudart, "cuda.bindings.runtime")
+        backend = CudaRuntimeBackend(cudart, "cuda.bindings.runtime")
+        stream = backend.stream_create()
+        backend.stream_destroy(stream)
+        return backend
     except Exception as e:
         errors.append(f"cuda.bindings.runtime: {e}")
     try:
-        return PyCudaBackend()
+        backend = PyCudaBackend()
+        stream = backend.stream_create()
+        backend.stream_destroy(stream)
+        return backend
     except Exception as e:
         errors.append(f"pycuda.driver: {e}")
     raise ImportError("TensorRT evaluation requires a CUDA Python backend. Tried: " + "; ".join(errors))
